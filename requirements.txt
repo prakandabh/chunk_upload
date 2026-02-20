@@ -1,0 +1,8 @@
+httpx
+python-dotenv
+minio
+soundfile
+yt-dlp
+spacy
+huggingface-hub
+ 
