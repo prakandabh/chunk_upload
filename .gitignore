@@ -48,4 +48,5 @@ Thumbs.db
 *.log
 .cache/
 workdir/
-
+metadata.csv
+upload_tracking.json
