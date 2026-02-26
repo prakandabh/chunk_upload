@@ -54,6 +54,7 @@ ENV_TEMPLATE_NAME = "TEMPLATE_NAME"        # Name of metadata template to use
 ENV_TEMPLATE_ID = "TEMPLATE_ID"            # ID of metadata template (alternative to name)
 ENV_BATCH_SIZE = "BATCH_SIZE"              # Number of files to process in each batch
 ENV_BATCH_DELAY_SECONDS = "BATCH_DELAY_SECONDS"  # Delay between batches to avoid rate limiting
+ENV_HF_SKIP_REMOTE_FILE_LIST = "HF_SKIP_REMOTE_FILE_LIST"  # Skip fetching HF file list (for large repos)
 
 
 # --------------------------------------------------------------------------
@@ -681,17 +682,42 @@ def fetch_templates(client: httpx.Client, base_url: str, headers: Dict[str, str]
     Returns:
         List of template dictionaries, each containing id, name, and fields
     """
-    print_info(MSG_FETCHING_TEMPLATES)
+    # print_info(MSG_FETCHING_TEMPLATES)
     # response = client.get(f"{base_url}{API_ENDPOINT_TEMPLATES}", headers=headers)
     # response.raise_for_status()
     # return response.json()
-    response = client.get(f"{base_url}{API_ENDPOINT_TEMPLATES}", headers=headers)
+    # # response = client.get(f"{base_url}{API_ENDPOINT_TEMPLATES}", headers=headers)
+    # # response.raise_for_status()
+    # # body = response.json()
+    # # print(f"Template response type: {type(body)}")
+    # # print(body)
+
+    # # return body
+
+    print_info(MSG_FETCHING_TEMPLATES)
+    response = client.get(
+        f"{base_url}{API_ENDPOINT_TEMPLATES}",
+        params={"page_size": 100},
+        headers=headers
+    )
     response.raise_for_status()
     body = response.json()
-    # print(f"Template response type: {type(body)}")
-    # print(body)
 
-    return body
+    # Normalize: API may return list directly or wrapped in a key
+    items = []
+    if isinstance(body, list):
+        items = body
+    elif isinstance(body, dict):
+        for key in ("data", "templates", "results", "items"):
+            if key in body and isinstance(body[key], list):
+                items = body[key]
+                break
+        else:
+            if "id" in body and "name" in body:
+                items = [body]
+
+    # Filter to dicts only (API may return mixed types)
+    return [t for t in items if isinstance(t, dict)]
 
 def print_templates_list(templates: List[Dict]) -> None:
     """
@@ -704,7 +730,7 @@ def print_templates_list(templates: List[Dict]) -> None:
         templates: List of template dictionaries from fetch_templates()
     """
     print_info(MSG_FOUND_TEMPLATES.format(count=len(templates)))
-    for i, template in enumerate(templates, 1):
+    for i, template in enumerate((t for t in templates if isinstance(t, dict)), 1):
         name = template.get(TEMPLATE_FIELD_NAME, UNNAMED_FIELD)
         template_id = template.get(TEMPLATE_FIELD_ID)
         print(MSG_TEMPLATE_ITEM.format(num=i, name=name, id=template_id))
@@ -725,6 +751,8 @@ def find_template_by_name(templates: List[Dict], template_name: str) -> Optional
         Template dictionary if found, None otherwise
     """
     for template in templates:
+        if not isinstance(template, dict):
+            continue
         if template.get(TEMPLATE_FIELD_NAME, EMPTY_STRING).lower() == template_name.lower():
             return template
     return None
@@ -1759,6 +1787,7 @@ def load_configuration() -> Dict:
         "template_id": get_env(ENV_TEMPLATE_ID),
         "batch_size": int(get_env(ENV_BATCH_SIZE)),
         "batch_delay_seconds": int(get_env(ENV_BATCH_DELAY_SECONDS)),
+        "hf_skip_remote_file_list": get_env(ENV_HF_SKIP_REMOTE_FILE_LIST).lower() in ("1", "true", "yes"),
     }
 
 
@@ -1824,7 +1853,7 @@ def load_template_for_client(
         # Load by name (search first, then fetch)
         print_info(MSG_SEARCHING_TEMPLATE_BY_NAME.format(name=template_name))
         templates = fetch_templates(client, base_url, headers)
-        print_templates_list(templates)
+        # print_templates_list(templates)
         
         template_match = find_template_by_name(templates, template_name)
         if not template_match:
@@ -2069,11 +2098,20 @@ def main() -> None:
         tracking_data = download_tracking_file(config["hf_repo_id"], config["hf_token"])
 
         api = HfApi(token=config["hf_token"])
-        print_info("Fetching remote file list from HuggingFace to prevent duplicates...")
-        
-        # Get all files currently in the repo and store in a Set for fast lookup
-        # We look specifically in the 'data/' folder if that's where your chunks live
-        remote_file_list = set(api.list_repo_files(repo_id=config["hf_repo_id"], repo_type="dataset"))
+        remote_file_list = set()
+        if config.get("hf_skip_remote_file_list"):
+            print_info("Skipping remote file list (HF_SKIP_REMOTE_FILE_LIST is set). Using tracking file only.")
+        else:
+            print_info("Fetching remote file list from HuggingFace to prevent duplicates...")
+            try:
+                remote_file_list = set(
+                    api.list_repo_files(
+                        repo_id=config["hf_repo_id"],
+                        repo_type="dataset",
+                    )
+                )
+            except (httpx.ReadTimeout, httpx.ConnectTimeout, OSError) as e:
+                print_warn(f"Could not fetch remote file list ({type(e).__name__}). Using tracking file only.")
         
         # ---------------------------------------------------------------------
         # 3. AUTHENTICATION PHASE
