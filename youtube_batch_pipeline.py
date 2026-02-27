@@ -23,6 +23,7 @@ Main workflow:
 import csv
 import json
 import os
+import random
 import shutil
 import time
 import traceback
@@ -55,6 +56,8 @@ ENV_TEMPLATE_ID = "TEMPLATE_ID"            # ID of metadata template (alternativ
 ENV_BATCH_SIZE = "BATCH_SIZE"              # Number of files to process in each batch
 ENV_BATCH_DELAY_SECONDS = "BATCH_DELAY_SECONDS"  # Delay between batches to avoid rate limiting
 ENV_HF_SKIP_REMOTE_FILE_LIST = "HF_SKIP_REMOTE_FILE_LIST"  # Skip fetching HF file list (for large repos)
+ENV_RUN_UPLOAD_LOWER_BOUND = "RUN_UPLOAD_LOWER_BOUND"  # Minimum files to upload in one run
+ENV_RUN_UPLOAD_UPPER_BOUND = "RUN_UPLOAD_UPPER_BOUND"  # Maximum files to upload in one run
 
 
 # --------------------------------------------------------------------------
@@ -1788,6 +1791,8 @@ def load_configuration() -> Dict:
         "batch_size": int(get_env(ENV_BATCH_SIZE)),
         "batch_delay_seconds": int(get_env(ENV_BATCH_DELAY_SECONDS)),
         "hf_skip_remote_file_list": get_env(ENV_HF_SKIP_REMOTE_FILE_LIST).lower() in ("1", "true", "yes"),
+        "run_upload_lower_bound": int(get_env(ENV_RUN_UPLOAD_LOWER_BOUND, "100")),
+        "run_upload_upper_bound": int(get_env(ENV_RUN_UPLOAD_UPPER_BOUND, "150")),
     }
 
 
@@ -2160,13 +2165,26 @@ def main() -> None:
         # Filter out files that are already uploaded
         uploaded_files = get_all_uploaded_files(tracking_data)
         new_files = filter_new_files(metadata_list, uploaded_files)
-        
-        print_metadata_summary(metadata_list, uploaded_files, new_files)
-        
+
+        available_count = len(new_files)
+
         # Exit early if nothing to do
-        if not new_files:
+        if not available_count:
+            print_metadata_summary(metadata_list, uploaded_files, new_files)
             print_info(MSG_NO_NEW_FILES)
             return
+
+        # Select random run size within configured bounds.
+        lower_bound = max(1, config["run_upload_lower_bound"])
+        upper_bound = max(lower_bound, config["run_upload_upper_bound"])
+        selected_count = min(random.randint(lower_bound, upper_bound), available_count)
+        selected_files = new_files[:selected_count]
+
+        print_info(
+            f"Run upload target selected randomly: {selected_count} "
+            f"(bounds={lower_bound}-{upper_bound}, available={available_count})"
+        )
+        print_metadata_summary(metadata_list, uploaded_files, selected_files)
         
         # ---------------------------------------------------------------------
         # 6. BATCH PROCESSING PHASE
@@ -2194,7 +2212,7 @@ def main() -> None:
         # Process files in batches with rate limiting
         try:
             success_count, fail_count = process_batch_with_delay(
-                new_files,
+                selected_files,
                 process_wrapper,
                 config["batch_size"],
                 config["batch_delay_seconds"]
@@ -2210,7 +2228,7 @@ def main() -> None:
         
         # Print final statistics
         all_uploaded = len(get_all_uploaded_files(tracking_data))
-        print_upload_summary(success_count, fail_count, len(new_files), all_uploaded)
+        print_upload_summary(success_count, fail_count, len(selected_files), all_uploaded)
     
     finally:
         # Always close HTTP client, even if an error occurred
