@@ -1439,11 +1439,11 @@ def prepare_field_values(metadata_row: Dict) -> Dict[str, str]:
         FIELD_MAIN_AUDIO_NAME: strip_or_empty(metadata_row.get(CSV_COLUMN_MAIN_AUDIO_NAME)),
         FIELD_LANGUAGE: strip_or_empty(metadata_row.get(CSV_COLUMN_LANGUAGE)).capitalize(),
         FIELD_DOMAIN: strip_or_empty(metadata_row.get(CSV_COLUMN_DOMAIN)).capitalize(),
-        FIELD_LOCATION: strip_or_empty(metadata_row.get(CSV_COLUMN_LOCATION)),
+        FIELD_LOCATION: strip_or_empty(metadata_row.get(CSV_COLUMN_LOCATION)).capitalize(),
         FIELD_SPEAKER_ID: strip_or_empty(metadata_row.get(CSV_COLUMN_SPEAKER_ID)),
         FIELD_DURATION: strip_or_empty(metadata_row.get(CSV_COLUMN_DURATION)),
         FIELD_AGE: strip_or_empty(metadata_row.get(CSV_COLUMN_AGE)),
-        FIELD_GENDER: strip_or_empty(metadata_row.get(CSV_COLUMN_GENDER)),
+        FIELD_GENDER: strip_or_empty(metadata_row.get(CSV_COLUMN_GENDER)).capitalize(),
     }
 
 
