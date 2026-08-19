@@ -1624,50 +1624,6 @@ def prepare_field_values(metadata_row: Dict) -> Dict[str, str]:
 # These are the high-level orchestration functions that tie everything together.
 # They coordinate downloads, metadata preparation, uploads, and cleanup.
 
-def download_audio_files_from_hf(
-    repo_id: str,
-    main_audio_name: str,
-    token: Optional[str],
-    local_dir: Path
-) -> Tuple[Path, List[Tuple[Path, int]], Dict, bool]:
-    """
-    Download main audio, chunks, and JSON metadata.
-
-    Returns:
-        Tuple of (main_audio_path, chunk_files, audio_metadata, all_chunks_present)
-        - all_chunks_present: True if every expected chunk was downloaded
-    """
-    audio_folder = f"{DIR_AUDIO}/{main_audio_name}"
-
-    print_info(MSG_DOWNLOADING_FILES.format(name=main_audio_name))
-
-    # Download JSON metadata
-    json_filename = f"{audio_folder}/{main_audio_name}{FILE_EXTENSION_JSON}"
-    json_path = download_file_from_hf(repo_id, json_filename, token, local_dir)
-    audio_metadata = load_json_metadata(json_path)
-
-    # Download main audio file
-    main_audio_filename = f"{audio_folder}/{audio_metadata[JSON_KEY_MAIN_FILE_NAME]}"
-    main_audio_path = download_file_from_hf(repo_id, main_audio_filename, token, local_dir)
-
-    # Download chunk files with fallback logic
-    chunk_files, missing_indices = download_chunks_with_progress(
-        repo_id,
-        audio_folder,
-        audio_metadata[JSON_KEY_CHUNK_FILES],
-        token,
-        local_dir
-    )
-
-    all_present = (len(missing_indices) == 0)
-    if not all_present:
-        print_warn(f"Missing {len(missing_indices)} chunks for {main_audio_name}; will skip upload")
-
-    print_ok(MSG_DOWNLOADED_CHUNKS.format(count=len(chunk_files), name=main_audio_name))
-
-    return main_audio_path, chunk_files, audio_metadata, all_present
-
-
 def upload_audio_to_api(
     client: httpx.Client,
     base_url: str,
@@ -1729,7 +1685,9 @@ def process_single_audio_file(
     template_fields: Dict[str, str],
     tracking_data: Dict,
     remote_file_list: Set[str],
-    stats: Dict
+    stats: Dict,
+    api_username: str,
+    api_password: str
 ) -> None:
     """
     Process a single audio file: download from HuggingFace, upload to API, track, cleanup.
@@ -1741,7 +1699,7 @@ def process_single_audio_file(
     3. Normalize language code
     4. Prepare metadata fields
     5. Build upload metadata
-    6. Upload to API
+    6. Upload to API (with token refresh on 401)
     7. Mark as uploaded in tracking data
     8. Upload updated tracking file to HuggingFace
     9. Clean up downloaded files
@@ -1755,12 +1713,14 @@ def process_single_audio_file(
         workdir: Working directory for downloads
         client: HTTP client for API requests
         base_url: API base URL
-        headers: Authorization headers
+        headers: Authorization headers (will be updated on token refresh)
         template_id: Metadata template ID
         template_fields: Field name to ID mappings
         tracking_data: Tracking data dictionary (will be modified)
         remote_file_list: Set of remote file names from HF (for verification)
         stats: Dictionary to accumulate statistics (audio_count, chunk_count)
+        api_username: Username for API re-authentication
+        api_password: Password for API re-authentication
         
     Raises:
         Exception: Any error during processing (download, upload, etc.)
@@ -1828,11 +1788,32 @@ def process_single_audio_file(
             print_error(MSG_SKIPPING_AUDIO.format(name=main_audio_name))
             return
         
-        # Step 5: Upload to API
-        result = upload_audio_to_api(
-            client, base_url, headers, template_id,
-            main_audio_path, chunk_files, language_full, upload_metadata
-        )
+        # Step 5: Upload to API with token refresh on 401
+        max_retries = 2
+        last_exception = None
+        for attempt in range(max_retries):
+            try:
+                result = upload_audio_to_api(
+                    client, base_url, headers, template_id,
+                    main_audio_path, chunk_files, language_full, upload_metadata
+                )
+                # Success - break out of retry loop
+                break
+            except httpx.HTTPStatusError as e:
+                last_exception = e
+                if e.response.status_code == 401 and attempt < max_retries - 1:
+                    print_warn("Token expired, re-authenticating...")
+                    new_token = perform_login(client, base_url, api_username, api_password)
+                    # Update the headers dictionary with the new token
+                    headers.update(create_auth_headers(new_token))
+                    continue
+                else:
+                    # Not a 401, or last attempt failed
+                    raise
+        else:
+            # If we exhausted all retries without success, re-raise the last exception
+            if last_exception:
+                raise last_exception
         
         # Step 6: Mark as successfully uploaded in tracking data
         chunk_count = len(chunk_files)
@@ -2399,7 +2380,9 @@ def main() -> None:
                 field_mappings,
                 tracking_data,
                 remote_file_list,
-                stats
+                stats,
+                config["api_username"],
+                config["api_password"]
             )
         
         # Process files in batches with rate limiting
