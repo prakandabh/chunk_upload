@@ -27,6 +27,7 @@ import random
 import shutil
 import time
 import traceback
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple, Callable
@@ -58,6 +59,9 @@ ENV_BATCH_DELAY_SECONDS = "BATCH_DELAY_SECONDS"  # Delay between batches to avoi
 ENV_HF_SKIP_REMOTE_FILE_LIST = "HF_SKIP_REMOTE_FILE_LIST"  # Skip fetching HF file list (for large repos)
 ENV_RUN_UPLOAD_LOWER_BOUND = "RUN_UPLOAD_LOWER_BOUND"  # Minimum files to upload in one run
 ENV_RUN_UPLOAD_UPPER_BOUND = "RUN_UPLOAD_UPPER_BOUND"  # Maximum files to upload in one run
+ENV_HF_DOWNLOAD_RETRIES = "HF_DOWNLOAD_RETRIES"          # Number of download retry attempts
+ENV_HF_DOWNLOAD_BASE_DELAY = "HF_DOWNLOAD_BASE_DELAY"    # Initial delay in seconds (exponential backoff)
+ENV_HF_DOWNLOAD_MAX_DELAY = "HF_DOWNLOAD_MAX_DELAY"      # Maximum delay in seconds
 
 
 # --------------------------------------------------------------------------
@@ -71,6 +75,7 @@ FILE_TRACKING_JSON = "upload_tracking.json"  # JSON file tracking uploaded files
 FILE_METADATA_CSV = "metadata.csv"         # CSV file containing metadata for all audio files
 FILE_EXTENSION_JSON = ".json"              # JSON file extension
 FILE_EXTENSION_WAV = ".wav"                # WAV audio file extension
+DIR_LOGS = "logs"                          # Directory to store log files
 
 # --------------------------------------------------------------------------
 # Tracking File Structure
@@ -82,6 +87,7 @@ TRACKING_KEY_UPLOADED_FILES = "uploaded_files"  # Dictionary of uploaded file re
 TRACKING_KEY_TIMESTAMP = "upload_timestamp"     # When file was uploaded
 TRACKING_KEY_API_RESPONSE = "api_response"      # Response from API
 TRACKING_KEY_METADATA = "metadata_json"         # Metadata sent with upload
+TRACKING_KEY_CHUNK_COUNT = "chunk_count"        # Number of chunks uploaded for this file (added)
 TRACKING_VERSION = "1.0"                        # Current tracking file version
 
 # --------------------------------------------------------------------------
@@ -291,6 +297,11 @@ MSG_UPLOAD_SUMMARY = "Success: {success}/{total}"
 MSG_FAILED_SUMMARY = "Failed: {failed}/{total}"
 MSG_TOTAL_UPLOADED_ALL_TIME = "Total uploaded (all time): {count}"
 MSG_HF_TOKEN_REQUIRED = "HF_TOKEN is required to upload tracking file to HuggingFace repository"
+MSG_TOTAL_CHUNKS_ALL_TIME = "Total chunks uploaded (all time): {count}"
+MSG_NEW_CHUNKS_UPLOADED = "New chunks uploaded this run: {count}"
+MSG_NEW_AUDIO_UPLOADED = "New audio files uploaded this run: {count}"
+MSG_DOWNLOAD_RETRY = "Download attempt {attempt}/{max_retries} failed for {filename}: {error}. Retrying in {delay}s..."
+MSG_DOWNLOAD_RETRY_EXHAUSTED = "All {max_retries} download attempts failed for {filename}"
 
 # --------------------------------------------------------------------------
 # Section Headers
@@ -347,20 +358,6 @@ def get_env(key: str, default: str = "") -> str:
     return os.getenv(key, default)
 
 
-# def get_env_int(key: str, default: str) -> int:
-#     """
-#     Get environment variable as an integer.
-    
-#     Args:
-#         key: Environment variable name to retrieve
-#         default: Default value as string (will be converted to int)
-        
-#     Returns:
-#         Integer value of the environment variable
-#     """
-#     return int(get_env(key, default))
-
-
 def create_directory(path: Path) -> Path:
     """
     Create directory if it doesn't exist.
@@ -377,37 +374,51 @@ def create_directory(path: Path) -> Path:
 
 def print_info(message: str) -> None:
     """Print informational message with [INFO] prefix."""
-    print(f"{MSG_INFO_PREFIX} {message}")
+    msg = f"{MSG_INFO_PREFIX} {message}"
+    print(msg)
+    logging.info(message)
 
 
 def print_ok(message: str) -> None:
     """Print success message with [OK] prefix."""
-    print(f"{MSG_OK_PREFIX} {message}")
+    msg = f"{MSG_OK_PREFIX} {message}"
+    print(msg)
+    logging.info(message)
 
 
 def print_warn(message: str) -> None:
     """Print warning message with [WARN] prefix."""
-    print(f"{MSG_WARN_PREFIX} {message}")
+    msg = f"{MSG_WARN_PREFIX} {message}"
+    print(msg)
+    logging.warning(message)
 
 
 def print_error(message: str) -> None:
     """Print error message with [ERROR] prefix."""
-    print(f"{MSG_ERROR_PREFIX} {message}")
+    msg = f"{MSG_ERROR_PREFIX} {message}"
+    print(msg)
+    logging.error(message)
 
 
 def print_debug(message: str) -> None:
     """Print debug message with [DEBUG] prefix."""
-    print(f"{MSG_DEBUG_PREFIX} {message}")
+    msg = f"{MSG_DEBUG_PREFIX} {message}"
+    print(msg)
+    logging.debug(message)
 
 
 def print_skip(message: str) -> None:
     """Print skip message with [SKIP] prefix."""
-    print(f"{MSG_SKIP_PREFIX} {message}")
+    msg = f"{MSG_SKIP_PREFIX} {message}"
+    print(msg)
+    logging.info(message)
 
 
 def print_success(message: str) -> None:
     """Print success message with [SUCCESS] prefix."""
-    print(f"{MSG_SUCCESS_PREFIX} {message}")
+    msg = f"{MSG_SUCCESS_PREFIX} {message}"
+    print(msg)
+    logging.info(message)
 
 
 def get_current_timestamp() -> str:
@@ -445,6 +456,81 @@ def strip_or_empty(value: Optional[str]) -> str:
         Stripped string or empty string if value was None
     """
     return value.strip() if value else EMPTY_STRING
+
+
+def generate_alternative_chunk_filename(original_filename: str) -> Optional[str]:
+    """
+    Generate an alternative chunk filename for common naming mismatches.
+
+    Example: 'audio_name_chunk_001.wav' -> 'audio_name_1.wav'
+    (removes '_chunk_' and zero-padding from the numeric part).
+
+    Returns None if the pattern does not match.
+    """
+    if "_chunk_" not in original_filename:
+        return None
+
+    try:
+        base, num_ext = original_filename.split("_chunk_", 1)
+        # num_ext is like "001.wav" or "001"
+        if "." in num_ext:
+            num_part, ext = num_ext.split(".", 1)
+        else:
+            num_part, ext = num_ext, ""
+        # Remove leading zeros by converting to int
+        num_int = int(num_part)
+        alt = f"{base}_{num_int}"
+        if ext:
+            alt += f".{ext}"
+        return alt
+    except (ValueError, TypeError):
+        return None
+
+
+def setup_logging() -> None:
+    """
+    Set up logging to a file in the logs directory.
+    Creates a log file with timestamp in its name.
+    """
+    logs_dir = Path(DIR_LOGS)
+    logs_dir.mkdir(exist_ok=True)
+
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    log_filename = logs_dir / f"upload_{timestamp}.log"
+
+    # Remove any existing handlers from root logger to avoid duplicates
+    for handler in logging.root.handlers[:]:
+        logging.root.removeHandler(handler)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        handlers=[
+            logging.FileHandler(log_filename, encoding=ENCODING_UTF8),
+            # We keep console output via print functions, but we also add a stream handler
+            # to capture any direct logging calls (e.g., from third-party libs)
+            logging.StreamHandler()
+        ]
+    )
+    # Set the stream handler to a higher level to avoid duplicate console messages
+    # since we use print functions for console output.
+    for handler in logging.root.handlers:
+        if isinstance(handler, logging.StreamHandler) and handler.stream == sys.stdout:
+            handler.setLevel(logging.WARNING)
+    # Also log the start of the script
+    logging.info("Script started")
+    print_info(f"Log file: {log_filename}")
+
+
+def compute_total_uploaded_chunks(tracking_data: Dict) -> int:
+    """
+    Compute the total number of chunks uploaded across all files.
+    """
+    uploaded_files = tracking_data.get(TRACKING_KEY_UPLOADED_FILES, {})
+    total = 0
+    for record in uploaded_files.values():
+        total += record.get(TRACKING_KEY_CHUNK_COUNT, 0)
+    return total
 
 
 # ============================================================================
@@ -566,7 +652,8 @@ def mark_as_uploaded(
     tracking_data: Dict,
     main_audio_name: str,
     api_response: str,
-    metadata: Dict
+    metadata: Dict,
+    chunk_count: int
 ) -> None:
     """
     Mark an audio file as successfully uploaded in the tracking data.
@@ -580,6 +667,7 @@ def mark_as_uploaded(
         main_audio_name: Unique name of the audio file
         api_response: JSON string of the API's response
         metadata: Dictionary of metadata that was sent with the upload
+        chunk_count: Number of chunk files uploaded for this audio
     """
     if TRACKING_KEY_UPLOADED_FILES not in tracking_data:
         tracking_data[TRACKING_KEY_UPLOADED_FILES] = {}
@@ -587,7 +675,8 @@ def mark_as_uploaded(
     tracking_data[TRACKING_KEY_UPLOADED_FILES][main_audio_name] = {
         TRACKING_KEY_TIMESTAMP: get_current_timestamp(),
         TRACKING_KEY_API_RESPONSE: api_response,
-        TRACKING_KEY_METADATA: metadata
+        TRACKING_KEY_METADATA: metadata,
+        TRACKING_KEY_CHUNK_COUNT: chunk_count
     }
     
     print_ok(MSG_MARKED_UPLOADED.format(name=main_audio_name))
@@ -685,18 +774,6 @@ def fetch_templates(client: httpx.Client, base_url: str, headers: Dict[str, str]
     Returns:
         List of template dictionaries, each containing id, name, and fields
     """
-    # print_info(MSG_FETCHING_TEMPLATES)
-    # response = client.get(f"{base_url}{API_ENDPOINT_TEMPLATES}", headers=headers)
-    # response.raise_for_status()
-    # return response.json()
-    # # response = client.get(f"{base_url}{API_ENDPOINT_TEMPLATES}", headers=headers)
-    # # response.raise_for_status()
-    # # body = response.json()
-    # # print(f"Template response type: {type(body)}")
-    # # print(body)
-
-    # # return body
-
     print_info(MSG_FETCHING_TEMPLATES)
     response = client.get(
         f"{base_url}{API_ENDPOINT_TEMPLATES}",
@@ -721,6 +798,7 @@ def fetch_templates(client: httpx.Client, base_url: str, headers: Dict[str, str]
 
     # Filter to dicts only (API may return mixed types)
     return [t for t in items if isinstance(t, dict)]
+
 
 def print_templates_list(templates: List[Dict]) -> None:
     """
@@ -1165,10 +1243,11 @@ def download_file_from_hf(
     local_dir: Path
 ) -> Path:
     """
-    Download a single file from HuggingFace repository.
+    Download a single file from HuggingFace repository with retry logic.
     
     Uses the HuggingFace Hub library to download files. Files are cached
-    locally to avoid re-downloading.
+    locally to avoid re-downloading. In case of failure, retries with
+    exponential backoff (configurable via .env).
     
     Args:
         repo_id: HuggingFace repository ID (e.g., "user/dataset-name")
@@ -1179,14 +1258,45 @@ def download_file_from_hf(
     Returns:
         Path object pointing to the downloaded file
     """
-    file_path = hf_hub_download(
-        repo_id=repo_id,
-        filename=filename,
-        token=token,
-        repo_type=HF_REPO_TYPE_DATASET,  # Specify this is a dataset, not a model
-        local_dir=local_dir
-    )
-    return Path(file_path)
+    # Read retry settings from environment (with defaults)
+    max_retries = int(get_env(ENV_HF_DOWNLOAD_RETRIES, "3"))
+    base_delay = float(get_env(ENV_HF_DOWNLOAD_BASE_DELAY, "2.0"))
+    max_delay = float(get_env(ENV_HF_DOWNLOAD_MAX_DELAY, "60.0"))
+
+    last_exception = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            file_path = hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                token=token,
+                repo_type=HF_REPO_TYPE_DATASET,
+                local_dir=local_dir
+            )
+            return Path(file_path)
+        except Exception as e:
+            last_exception = e
+            if attempt == max_retries:
+                print_error(MSG_DOWNLOAD_RETRY_EXHAUSTED.format(
+                    max_retries=max_retries,
+                    filename=filename
+                ))
+                break
+            # Exponential backoff with jitter (random up to 0.1 * delay)
+            delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
+            jitter = random.uniform(0, 0.1 * delay)
+            sleep_time = delay + jitter
+            print_warn(MSG_DOWNLOAD_RETRY.format(
+                attempt=attempt,
+                max_retries=max_retries,
+                filename=filename,
+                error=str(e),
+                delay=round(sleep_time, 2)
+            ))
+            time.sleep(sleep_time)
+
+    # If all retries failed, raise the last exception
+    raise last_exception
 
 
 def parse_metadata_csv(csv_path: Path) -> List[Dict]:
@@ -1279,39 +1389,100 @@ def download_chunks_with_progress(
     chunk_files_info: List[Dict],
     token: Optional[str],
     local_dir: Path
-) -> List[Tuple[Path, int]]:
+) -> Tuple[List[Tuple[Path, int]], List[int]]:
     """
-    Download chunk files with progress reporting.
-    
-    Downloads all chunk files for an audio file, showing progress
-    every 10 chunks to keep the user informed without spam.
-    
-    Args:
-        repo_id: HuggingFace repository ID
-        audio_folder: Folder path within repo (e.g., "audio/audio_001")
-        chunk_files_info: List of chunk metadata from JSON
-        token: HuggingFace API token
-        local_dir: Local download directory
-        
+    Download chunk files with progress reporting and fallback naming.
+
     Returns:
-        List of (chunk_path, order) tuples
+        Tuple of (downloaded_chunks, missing_indices)
+        - downloaded_chunks: list of (chunk_path, order) for successfully downloaded chunks
+        - missing_indices: list of 0‑based indices of chunks that could not be downloaded
     """
     chunk_files = []
+    missing_indices = []
     total_chunks = len(chunk_files_info)
-    
+
     print_info(MSG_DOWNLOADING_CHUNKS.format(count=total_chunks))
-    
-    for idx, chunk_info in enumerate(chunk_files_info, 1):
-        chunk_filename = f"{audio_folder}/{chunk_info[JSON_KEY_NAME]}"
-        
-        # Show progress every 10 chunks (or at the end)
-        if idx % CHUNK_PROGRESS_INTERVAL == 0 or idx == total_chunks:
-            print_info(MSG_DOWNLOAD_PROGRESS.format(current=idx, total=total_chunks))
-        
-        chunk_path = download_file_from_hf(repo_id, chunk_filename, token, local_dir)
-        chunk_files.append((chunk_path, chunk_info[JSON_KEY_ORDER]))
-    
-    return chunk_files
+
+    for idx, chunk_info in enumerate(chunk_files_info):
+        # Show progress every 10 chunks
+        if (idx + 1) % CHUNK_PROGRESS_INTERVAL == 0 or (idx + 1) == total_chunks:
+            print_info(MSG_DOWNLOAD_PROGRESS.format(current=idx + 1, total=total_chunks))
+
+        original_chunk_name = chunk_info[JSON_KEY_NAME]
+        original_path = f"{audio_folder}/{original_chunk_name}"
+        downloaded = False
+
+        # Attempt 1: try the exact name from the JSON
+        try:
+            chunk_path = download_file_from_hf(repo_id, original_path, token, local_dir)
+            chunk_files.append((chunk_path, chunk_info[JSON_KEY_ORDER]))
+            downloaded = True
+        except Exception as e1:
+            # Attempt 2: try the alternative naming (if available)
+            alt_name = generate_alternative_chunk_filename(original_chunk_name)
+            if alt_name:
+                alt_path = f"{audio_folder}/{alt_name}"
+                try:
+                    chunk_path = download_file_from_hf(repo_id, alt_path, token, local_dir)
+                    chunk_files.append((chunk_path, chunk_info[JSON_KEY_ORDER]))
+                    downloaded = True
+                    print_debug(f"Downloaded fallback: {alt_name}")
+                except Exception as e2:
+                    print_warn(f"Fallback failed for {alt_name}: {e2}")
+
+        if not downloaded:
+            print_warn(f"Chunk {original_chunk_name} missing, skipping")
+            missing_indices.append(idx)   # 0‑based index
+
+    if missing_indices:
+        print_warn(f"Missing {len(missing_indices)} chunks: indices {missing_indices}")
+
+    return chunk_files, missing_indices
+
+
+def download_audio_files_from_hf(
+    repo_id: str,
+    main_audio_name: str,
+    token: Optional[str],
+    local_dir: Path
+) -> Tuple[Path, List[Tuple[Path, int]], Dict, bool]:
+    """
+    Download main audio, chunks, and JSON metadata.
+
+    Returns:
+        Tuple of (main_audio_path, chunk_files, audio_metadata, all_chunks_present)
+        - all_chunks_present: True if every expected chunk was downloaded
+    """
+    audio_folder = f"{DIR_AUDIO}/{main_audio_name}"
+
+    print_info(MSG_DOWNLOADING_FILES.format(name=main_audio_name))
+
+    # Download JSON metadata
+    json_filename = f"{audio_folder}/{main_audio_name}{FILE_EXTENSION_JSON}"
+    json_path = download_file_from_hf(repo_id, json_filename, token, local_dir)
+    audio_metadata = load_json_metadata(json_path)
+
+    # Download main audio file
+    main_audio_filename = f"{audio_folder}/{audio_metadata[JSON_KEY_MAIN_FILE_NAME]}"
+    main_audio_path = download_file_from_hf(repo_id, main_audio_filename, token, local_dir)
+
+    # Download chunk files with fallback logic
+    chunk_files, missing_indices = download_chunks_with_progress(
+        repo_id,
+        audio_folder,
+        audio_metadata[JSON_KEY_CHUNK_FILES],
+        token,
+        local_dir
+    )
+
+    all_present = (len(missing_indices) == 0)
+    if not all_present:
+        print_warn(f"Missing {len(missing_indices)} chunks for {main_audio_name}; will skip upload")
+
+    print_ok(MSG_DOWNLOADED_CHUNKS.format(count=len(chunk_files), name=main_audio_name))
+
+    return main_audio_path, chunk_files, audio_metadata, all_present
 
 
 # ============================================================================
@@ -1453,62 +1624,6 @@ def prepare_field_values(metadata_row: Dict) -> Dict[str, str]:
 # These are the high-level orchestration functions that tie everything together.
 # They coordinate downloads, metadata preparation, uploads, and cleanup.
 
-def download_audio_files_from_hf(
-    repo_id: str,
-    main_audio_name: str,
-    token: Optional[str],
-    local_dir: Path
-) -> Tuple[Path, List[Tuple[Path, int]], Dict]:
-    """
-    Download main audio, chunks, and JSON metadata for a specific audio file.
-    
-    This is a memory-efficient download process:
-    1. Download small JSON file first to get structure
-    2. Download main audio file
-    3. Download chunks with progress reporting
-    
-    All files for this audio are downloaded to:
-    {local_dir}/audio/{main_audio_name}/
-    
-    Args:
-        repo_id: HuggingFace repository ID
-        main_audio_name: Unique name of the audio file
-        token: HuggingFace API token
-        local_dir: Local directory to download to
-        
-    Returns:
-        Tuple of (main_audio_path, chunk_files, audio_metadata)
-        - main_audio_path: Path to downloaded main audio file
-        - chunk_files: List of (chunk_path, order) tuples
-        - audio_metadata: Dict from JSON with file structure info
-    """
-    audio_folder = f"{DIR_AUDIO}/{main_audio_name}"
-    
-    print_info(MSG_DOWNLOADING_FILES.format(name=main_audio_name))
-    
-    # Step 1: Download JSON metadata to know what files we need
-    json_filename = f"{audio_folder}/{main_audio_name}{FILE_EXTENSION_JSON}"
-    json_path = download_file_from_hf(repo_id, json_filename, token, local_dir)
-    audio_metadata = load_json_metadata(json_path)
-    
-    # Step 2: Download main audio file
-    main_audio_filename = f"{audio_folder}/{audio_metadata[JSON_KEY_MAIN_FILE_NAME]}"
-    main_audio_path = download_file_from_hf(repo_id, main_audio_filename, token, local_dir)
-    
-    # Step 3: Download all chunk files
-    chunk_files = download_chunks_with_progress(
-        repo_id,
-        audio_folder,
-        audio_metadata[JSON_KEY_CHUNK_FILES],
-        token,
-        local_dir
-    )
-    
-    print_ok(MSG_DOWNLOADED_CHUNKS.format(count=len(chunk_files), name=main_audio_name))
-    
-    return main_audio_path, chunk_files, audio_metadata
-
-
 def upload_audio_to_api(
     client: httpx.Client,
     base_url: str,
@@ -1569,7 +1684,10 @@ def process_single_audio_file(
     template_id: str,
     template_fields: Dict[str, str],
     tracking_data: Dict,
-    remote_file_list: Set[str]
+    remote_file_list: Set[str],
+    stats: Dict,
+    api_username: str,
+    api_password: str
 ) -> None:
     """
     Process a single audio file: download from HuggingFace, upload to API, track, cleanup.
@@ -1581,7 +1699,7 @@ def process_single_audio_file(
     3. Normalize language code
     4. Prepare metadata fields
     5. Build upload metadata
-    6. Upload to API
+    6. Upload to API (with token refresh on 401)
     7. Mark as uploaded in tracking data
     8. Upload updated tracking file to HuggingFace
     9. Clean up downloaded files
@@ -1595,10 +1713,14 @@ def process_single_audio_file(
         workdir: Working directory for downloads
         client: HTTP client for API requests
         base_url: API base URL
-        headers: Authorization headers
+        headers: Authorization headers (will be updated on token refresh)
         template_id: Metadata template ID
         template_fields: Field name to ID mappings
         tracking_data: Tracking data dictionary (will be modified)
+        remote_file_list: Set of remote file names from HF (for verification)
+        stats: Dictionary to accumulate statistics (audio_count, chunk_count)
+        api_username: Username for API re-authentication
+        api_password: Password for API re-authentication
         
     Raises:
         Exception: Any error during processing (download, upload, etc.)
@@ -1615,7 +1737,8 @@ def process_single_audio_file(
     if remote_path in remote_file_list:
         print_skip(f"Verified: {main_audio_name} exists on HF server. Updating local tracker.")
         # Mark it in the local tracker so the JSON eventually syncs
-        mark_as_uploaded(tracking_data, main_audio_name, "Verified on Server", {})
+        # We don't know chunk count here, so set to 0
+        mark_as_uploaded(tracking_data, main_audio_name, "Verified on Server", {}, 0)
         return
     
     # Check if already uploaded (avoid duplicates)
@@ -1627,9 +1750,14 @@ def process_single_audio_file(
         print_info(MSG_PROCESSING_AUDIO.format(name=main_audio_name))
         
         # Step 1: Download files from HuggingFace
-        main_audio_path, chunk_files, audio_metadata = download_audio_files_from_hf(
+        main_audio_path, chunk_files, audio_metadata, all_chunks_present = download_audio_files_from_hf(
             repo_id, main_audio_name, hf_token, workdir
         )
+
+        if not all_chunks_present:
+            print_warn(f"Skipping {main_audio_name} due to missing chunks; will retry later")
+            # Do NOT mark as uploaded – it will be retried in a future run
+            return
         
         # Step 2: Normalize language code to full uppercase name
         language_code = metadata_row[CSV_COLUMN_LANGUAGE].lower()
@@ -1660,19 +1788,45 @@ def process_single_audio_file(
             print_error(MSG_SKIPPING_AUDIO.format(name=main_audio_name))
             return
         
-        # Step 5: Upload to API
-        result = upload_audio_to_api(
-            client, base_url, headers, template_id,
-            main_audio_path, chunk_files, language_full, upload_metadata
-        )
+        # Step 5: Upload to API with token refresh on 401
+        max_retries = 2
+        last_exception = None
+        for attempt in range(max_retries):
+            try:
+                result = upload_audio_to_api(
+                    client, base_url, headers, template_id,
+                    main_audio_path, chunk_files, language_full, upload_metadata
+                )
+                # Success - break out of retry loop
+                break
+            except httpx.HTTPStatusError as e:
+                last_exception = e
+                if e.response.status_code == 401 and attempt < max_retries - 1:
+                    print_warn("Token expired, re-authenticating...")
+                    new_token = perform_login(client, base_url, api_username, api_password)
+                    # Update the headers dictionary with the new token
+                    headers.update(create_auth_headers(new_token))
+                    continue
+                else:
+                    # Not a 401, or last attempt failed
+                    raise
+        else:
+            # If we exhausted all retries without success, re-raise the last exception
+            if last_exception:
+                raise last_exception
         
         # Step 6: Mark as successfully uploaded in tracking data
-        mark_as_uploaded(tracking_data, main_audio_name, json.dumps(result), field_values)
+        chunk_count = len(chunk_files)
+        mark_as_uploaded(tracking_data, main_audio_name, json.dumps(result), field_values, chunk_count)
         
         # Step 7: Upload updated tracking file to HuggingFace
         upload_tracking_file(repo_id, hf_token, tracking_data)
         
         print_success(MSG_UPLOADED_SUCCESS.format(name=main_audio_name))
+        
+        # Update statistics
+        stats['audio_uploaded'] += 1
+        stats['chunks_uploaded'] += chunk_count
         
         # Step 8: Clean up downloaded files
         cleanup_downloaded_files(main_audio_name, main_audio_path, chunk_files, workdir)
@@ -2007,7 +2161,8 @@ def print_metadata_summary(metadata_list: List[Dict], uploaded_files: Set[str], 
     print_info(MSG_NEW_FILES_TO_UPLOAD.format(count=len(new_files)))
 
 
-def print_upload_summary(success_count: int, fail_count: int, total: int, all_uploaded: int) -> None:
+def print_upload_summary(success_count: int, fail_count: int, total: int, all_uploaded: int, 
+                         total_chunks_all: int, new_audio: int, new_chunks: int) -> None:
     """
     Print final upload summary.
     
@@ -2017,17 +2172,25 @@ def print_upload_summary(success_count: int, fail_count: int, total: int, all_up
         success_count: Number of successful uploads this session
         fail_count: Number of failed uploads this session
         total: Total number of files attempted this session
-        all_uploaded: Total files uploaded across all sessions
+        all_uploaded: Total audio files uploaded across all sessions
+        total_chunks_all: Total chunk files uploaded across all sessions
+        new_audio: New audio files uploaded in this session
+        new_chunks: New chunk files uploaded in this session
     """
     print(HEADER_UPLOAD_COMPLETE)
     print_info(MSG_UPLOAD_SUMMARY.format(success=success_count, total=total))
     print_info(MSG_FAILED_SUMMARY.format(failed=fail_count, total=total))
     print_info(MSG_TOTAL_UPLOADED_ALL_TIME.format(count=all_uploaded))
+    print_info(MSG_TOTAL_CHUNKS_ALL_TIME.format(count=total_chunks_all))
+    print_info(MSG_NEW_AUDIO_UPLOADED.format(count=new_audio))
+    print_info(MSG_NEW_CHUNKS_UPLOADED.format(count=new_chunks))
 
 
 # ============================================================================
 # MAIN EXECUTION
 # ============================================================================
+
+import sys
 
 def main() -> None:
     """
@@ -2039,6 +2202,7 @@ def main() -> None:
        - Load configuration from .env file
        - Validate required settings (including HF_TOKEN)
        - Create HTTP client for API requests
+       - Setup logging
     
     2. TRACKING FILE LOADING:
        - Download tracking file from HuggingFace repo
@@ -2077,6 +2241,9 @@ def main() -> None:
     # 1. INITIALIZATION PHASE
     # -------------------------------------------------------------------------
     
+    # Setup logging first
+    setup_logging()
+    
     # Load all configuration from environment
     config = load_configuration()
     print_configuration(config)
@@ -2093,6 +2260,12 @@ def main() -> None:
     # Initialize components
     workdir = create_directory(Path(DIR_WORKDIR))  # Create working directory
     client = httpx.Client(timeout=HTTP_TIMEOUT_SECONDS)  # Create HTTP client
+    
+    # Statistics
+    stats = {
+        'audio_uploaded': 0,
+        'chunks_uploaded': 0
+    }
     
     try:
         # ---------------------------------------------------------------------
@@ -2206,7 +2379,10 @@ def main() -> None:
                 template_id,
                 field_mappings,
                 tracking_data,
-                remote_file_list
+                remote_file_list,
+                stats,
+                config["api_username"],
+                config["api_password"]
             )
         
         # Process files in batches with rate limiting
@@ -2228,7 +2404,16 @@ def main() -> None:
         
         # Print final statistics
         all_uploaded = len(get_all_uploaded_files(tracking_data))
-        print_upload_summary(success_count, fail_count, len(selected_files), all_uploaded)
+        total_chunks_all = compute_total_uploaded_chunks(tracking_data)
+        print_upload_summary(
+            success_count, 
+            fail_count, 
+            len(selected_files), 
+            all_uploaded,
+            total_chunks_all,
+            stats['audio_uploaded'],
+            stats['chunks_uploaded']
+        )
     
     finally:
         # Always close HTTP client, even if an error occurred

@@ -50,3 +50,5 @@ Thumbs.db
 workdir/
 metadata.csv
 upload_tracking.json
+logs
+.env.migrate
